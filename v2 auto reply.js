@@ -349,11 +349,47 @@
     } catch { return false; }
   }
   async function typeTextReactSafe(el, text) {
-    // try a few strategies; return true if editor looks non-empty
-    if (tryInsertText(el, text)) return true;
-    if (await tryPasteEvent(el, text)) return true;
-    return tryRangeSet(el, text);
-  }
+    try {
+        // Chờ dialog xuất hiện
+        let dialog = await waitFor(() => document.querySelector('[role="dialog"], [data-testid="modalDialog"]'), 5000, 100);
+
+        // Nếu dialog không tồn tại, thử click nút "Reply" để mở
+        if (!dialog) {
+            const replyBtn = document.querySelector('[data-testid="reply"]');
+            if (replyBtn) {
+                replyBtn.click(); 
+                dialog = await waitFor(() => document.querySelector('[role="dialog"], [data-testid="modalDialog"]'), 5000, 100);
+                if (!dialog) {
+                    toast('R1.5: failed to open reply dialog');
+                    throw new Error('R1.5');
+                }
+            } else {
+                toast('R0: reply button not found');
+                throw new Error('R0');
+            }
+        }
+
+        // Chờ ô soạn thảo (el) xuất hiện và sẵn sàng trong dialog
+        const composer = await waitFor(() => dialog.querySelector('div[contenteditable="true"][role="textbox"], div[contenteditable="true"][data-testid*="tweetTextarea"]'), 5000, 100);
+        if (!composer) {
+            toast('R1: composer not found in dialog');
+            throw new Error('R1');
+        }
+
+        // Chỉ focus khi ô soạn thảo đã sẵn sàng
+        composer.focus();
+        const dt = new DataTransfer();
+        dt.setData("text/plain", text);
+        const paste = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+        composer.dispatchEvent(paste);
+        composer.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertFromPaste", data: text }));
+        await sleep(50);
+        return (composer.innerText || "").trim().length >= Math.min(1, text.length);
+    } catch (error) {
+        console.error('Error in typeTextReactSafe:', error);
+        return false;
+    }
+}
   async function waitButtonEnabled(btn, maxMs = 12000) {
     const start = Date.now();
     while (Date.now() - start < maxMs) {
