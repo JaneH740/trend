@@ -1,6 +1,7 @@
 // ==UserScript==
 // @name         X Auto-Reply from Google Sheet v2
 // @namespace    jane-tools
+// @author       janeviixl + Minhie
 // @version      2.2.0
 // @description  Reply to a tweet with random cleaned rows (col A) from a public Google Sheet (address bar / pubhtml / CSV). Optional keyword line supported. Hardened navigation, focus fixes, and submit fallbacks. Panel collapses into a circular button when hidden.
 // @match        https://x.com/*
@@ -671,3 +672,4 @@
 
   console.info("[XRW] Respect X/Twitter rules and rate limits. Content is posted verbatim from your sheet.");
 })();
+
