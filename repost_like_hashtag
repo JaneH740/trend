@@ -1,0 +1,345 @@
+// ==UserScript==
+// @name         X: Like + Repost by Hashtag (auto-scroll, skip ads, draggable circle)
+// @namespace    https://example.com
+// @version      1.1.0
+// @description  Like & Repost tweets that contain a given hashtag on hashtag/search pages; auto-scrolls while running; skips ads; rectangle panel ↔ purple circle UI
+// @match        https://twitter.com/hashtag/*
+// @match        https://x.com/hashtag/*
+// @match        https://twitter.com/search*
+// @match        https://x.com/search*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ========== Utils ========== */
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+
+  async function safeClick(el) {
+    if (!el) return false;
+    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch {}
+    try {
+      const rect = el.getBoundingClientRect();
+      const opts = { bubbles: true, cancelable: true, clientX: rect.left + 5, clientY: rect.top + 5 };
+      el.dispatchEvent(new MouseEvent('pointerdown', opts));
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      el.dispatchEvent(new MouseEvent('pointerup', opts));
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return true;
+    } catch { try { el.click(); return true; } catch { return false; } }
+  }
+
+  const store = {
+    get(k, d){ try{ return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+    set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+  };
+
+  function makeDraggable(el, positionKey) {
+    let isDown = false, sx=0, sy=0, startL=0, startT=0;
+    const saved = store.get(positionKey, null);
+    if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+      Object.assign(el.style, { left: saved.left+'px', top: saved.top+'px', right: 'auto', bottom: 'auto' });
+    }
+    el.addEventListener('mousedown', (e)=>{
+      isDown = true;
+      const r = el.getBoundingClientRect();
+      sx = e.clientX; sy = e.clientY; startL = r.left; startT = r.top;
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e)=>{
+      if (!isDown) return;
+      const nl = startL + (e.clientX - sx);
+      const nt = startT + (e.clientY - sy);
+      Object.assign(el.style, { left: nl+'px', top: nt+'px', right:'auto', bottom:'auto' });
+    });
+    document.addEventListener('mouseup', ()=>{
+      if (!isDown) return;
+      isDown = false;
+      const r = el.getBoundingClientRect();
+      store.set(positionKey, { left: r.left, top: r.top });
+    });
+  }
+
+  /* ========== Hashtag helpers ========== */
+  function getHashtagFromURL() {
+    const url = new URL(location.href);
+    const m = location.pathname.match(/\/hashtag\/([^/?#]+)/i);
+    if (m && m[1]) return decodeURIComponent(m[1]);
+    const q = url.searchParams.get('q') || '';
+    const hashMatch = q.match(/%23([A-Za-z0-9_]+)/) || q.match(/#([A-Za-z0-9_]+)/);
+    if (hashMatch && hashMatch[1]) return decodeURIComponent(hashMatch[1]);
+    return '';
+  }
+  const normTag = (tag) => (tag || '').replace(/^#/, '').trim();
+
+  function articleHasHashtag(article, tagNorm) {
+    if (!tagNorm) return true; // if not set, allow all
+    const tagLc = tagNorm.toLowerCase();
+
+    // Hashtag chips with /hashtag/<tag>
+    const anchors = article.querySelectorAll('a[role="link"][href*="/hashtag/"]');
+    for (const a of anchors) {
+      const m = a.getAttribute('href')?.match(/\/hashtag\/([^/?#]+)/i);
+      if (m && m[1] && normTag(decodeURIComponent(m[1])).toLowerCase() === tagLc) return true;
+    }
+
+    // Fallback: raw text contains "#tag"
+    const text = (article.innerText || '').toLowerCase();
+    return text.includes('#' + tagLc);
+  }
+
+  /* ========== Ad skip ========== */
+  function isAdArticle(article) {
+    // “Ad” badge in the header near the 3 dots
+    const badges = article.querySelectorAll('span, div');
+    if (Array.from(badges).some(el => el.textContent.trim() === 'Ad')) return true;
+    // Extra guard
+    if (/promoted/i.test(article.innerText || '')) return true;
+    return false;
+  }
+
+  /* ========== Tweet ID for de-dup ========== */
+  function getTweetId(article) {
+    // Prefer permalink style /<user>/status/<id>
+    const link = article.querySelector('a[href*="/status/"]');
+    const m = link?.getAttribute('href')?.match(/\/status\/(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  /* ========== Selection ========== */
+  function getActionableArticles(tagNorm, onlyWithHashtag) {
+    const all = Array.from(document.querySelectorAll('article'));
+    const withActions = all.filter(a =>
+      (a.querySelector('[data-testid="like"], [data-testid="unlike"]')) &&
+      (a.querySelector('[data-testid="retweet"], [data-testid="unretweet"]'))
+    );
+    return withActions.filter(a => !isAdArticle(a) && (!onlyWithHashtag || articleHasHashtag(a, tagNorm)));
+  }
+
+  /* ========== Actions ========== */
+  async function ensureLiked(article) {
+    if (article.querySelector('[data-testid="unlike"]')) return false;
+    const likeBtn = article.querySelector('[data-testid="like"]');
+    if (!likeBtn) return false;
+    await safeClick(likeBtn);
+    return true;
+  }
+
+  async function ensureReposted(article) {
+    if (article.querySelector('[data-testid="unretweet"]')) return false;
+    const rtBtn = article.querySelector('[data-testid="retweet"]');
+    if (!rtBtn) return false;
+    await safeClick(rtBtn);
+
+    // Confirm "Repost"
+    let confirm;
+    for (let i=0;i<20;i++){
+      await sleep(100);
+      confirm = document.querySelector('[data-testid="retweetConfirm"]')
+        || Array.from(document.querySelectorAll('div[role="menuitem"], div[role="button"]'))
+              .find(el => /repost/i.test(el.textContent || ''));
+      if (confirm) break;
+    }
+    if (confirm) { await safeClick(confirm); return true; }
+    return false;
+  }
+
+  /* ========== UI ========== */
+  const panel = document.createElement('div');
+  Object.assign(panel.style, {
+    position:'fixed', right:'16px', bottom:'16px', zIndex:'999999',
+    background:'rgba(24,24,24,0.95)', color:'#fff', padding:'12px 14px',
+    borderRadius:'12px', boxShadow:'0 6px 18px rgba(0,0,0,0.35)',
+    fontFamily:'system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif',
+    fontSize:'14px', userSelect:'none', cursor:'move'
+  });
+
+  const initialTag = normTag(getHashtagFromURL());
+  panel.innerHTML = `
+    <div style="font-weight:600;margin-bottom:6px;cursor:default;">Hashtag Like + Repost</div>
+
+    <label style="display:block;margin:6px 0 4px;cursor:default;">Hashtag:
+      <input id="xr-tag" type="text" placeholder="e.g. JimmySea" value="${initialTag}"
+             style="width:160px;margin-left:6px;" />
+    </label>
+
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin:6px 0;">
+      <label style="cursor:default;">
+        <input id="xr-only-hashtag" type="checkbox" checked />
+        only tweets containing this hashtag
+      </label>
+      <label style="cursor:default;">
+        <input id="xr-autoscroll" type="checkbox" checked />
+        auto scroll while running
+      </label>
+    </div>
+
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin:6px 0;">
+      <label style="cursor:default;">Max:
+        <input id="xr-max" type="number" min="1" value="150" style="width:70px;margin-left:6px;">
+      </label>
+      <label style="cursor:default;">Delay (ms):
+        <input id="xr-delay" type="number" min="0" value="900" style="width:80px;margin-left:6px;">
+      </label>
+      <label style="cursor:default;">Jitter (±ms):
+        <input id="xr-jitter" type="number" min="0" value="450" style="width:80px;margin-left:6px;">
+      </label>
+      <label style="cursor:default;">Scroll step (px):
+        <input id="xr-scroll-step" type="number" min="200" value="800" style="width:80px;margin-left:6px;">
+      </label>
+      <label style="cursor:default;">Scroll delay (ms):
+        <input id="xr-scroll-delay" type="number" min="200" value="1200" style="width:90px;margin-left:6px;">
+      </label>
+    </div>
+
+    <div style="display:flex;gap:8px;align-items:center;">
+      <button id="xr-scan"  style="padding:6px 10px;cursor:pointer;">Scan</button>
+      <button id="xr-start" style="padding:6px 10px;cursor:pointer;">Start</button>
+      <button id="xr-stop"  style="padding:6px 10px;cursor:pointer;">Stop</button>
+      <span id="xr-status" style="margin-left:auto;font-size:12px;opacity:0.9;white-space:nowrap;">Idle</span>
+      <button id="xr-hide"  style="padding:6px 10px;cursor:pointer;">Hide</button>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  const circle = document.createElement('div');
+  Object.assign(circle.style, {
+    position:'fixed', right:'20px', bottom:'20px', width:'46px', height:'46px',
+    borderRadius:'50%', background:'purple', color:'#fff', display:'none',
+    alignItems:'center', justifyContent:'center', zIndex:'999999',
+    boxShadow:'0 6px 18px rgba(0,0,0,0.35)', fontWeight:'700', fontSize:'18px',
+    userSelect:'none', cursor:'move'
+  });
+  circle.title = 'Show controls';
+  circle.textContent = '⋯';
+  document.body.appendChild(circle);
+
+  const wasMin = store.get('xh:min', false);
+  if (wasMin) { panel.style.display='none'; circle.style.display='flex'; }
+  makeDraggable(panel, 'xh:panel:pos');
+  makeDraggable(circle, 'xh:circle:pos');
+  circle.addEventListener('click', ()=>{ panel.style.display='block'; circle.style.display='none'; store.set('xh:min', false); });
+  panel.querySelector('#xr-hide').addEventListener('click', ()=>{ panel.style.display='none'; circle.style.display='flex'; store.set('xh:min', true); });
+
+  const $ = sel => panel.querySelector(sel);
+  const statusEl = $('#xr-status');
+  const scanBtn  = $('#xr-scan');
+  const startBtn = $('#xr-start');
+  const stopBtn  = $('#xr-stop');
+  const setStatus = (msg)=> { statusEl.textContent = msg; };
+
+  /* ========== Runner with auto-scroll ========== */
+  let running = false;
+  const processedIds = new Set();
+
+  function currentTagNorm() { return normTag($('#xr-tag').value || ''); }
+
+  function scan() {
+    const tag = currentTagNorm();
+    const only = $('#xr-only-hashtag').checked;
+    const articles = getActionableArticles(tag, only);
+    // Show how many match + how many are new (not processed yet)
+    const newOnes = articles.filter(a => {
+      const id = getTweetId(a);
+      return id ? !processedIds.has(id) : true;
+    });
+    setStatus(`Found ${articles.length} / New ${newOnes.length}`);
+    return { total: articles.length, fresh: newOnes.length };
+  }
+
+  async function autoScrollOnce(stepPx, waitMs) {
+    window.scrollBy(0, stepPx);
+    await sleep(waitMs);
+  }
+
+  async function run() {
+    running = true;
+
+    const tag = currentTagNorm();
+    const only = $('#xr-only-hashtag').checked;
+
+    const maxN = Math.max(1, parseInt($('#xr-max').value || '150', 10));
+    const delay = Math.max(0, parseInt($('#xr-delay').value || '900', 10));
+    const jitter = Math.max(0, parseInt($('#xr-jitter').value || '450', 10));
+    const doScroll = $('#xr-autoscroll').checked;
+    const stepPx = Math.max(200, parseInt($('#xr-scroll-step').value || '800', 10));
+    const scrollDelay = Math.max(200, parseInt($('#xr-scroll-delay').value || '1200', 10));
+
+    let acted = 0;
+    let idleScrolls = 0;
+
+    while (running && acted < maxN) {
+      // (Re)collect actionable articles each loop to pick up newly loaded items
+      const articles = getActionableArticles(tag, only);
+
+      // Process any fresh ones
+      let progressedThisLoop = false;
+      for (const a of articles) {
+        if (!running || acted >= maxN) break;
+
+        const id = getTweetId(a);
+        if (id && processedIds.has(id)) continue; // de-dup
+        // Ensure tweet has controls
+        if (!a.querySelector('[role="group"]')) continue;
+
+        try {
+          const liked = await ensureLiked(a);
+          await sleep(delay + randInt(-jitter, jitter));
+
+          const reposted = await ensureReposted(a);
+          await sleep(delay + randInt(-jitter, jitter));
+
+          if (liked || reposted) {
+            acted++;
+            progressedThisLoop = true;
+          }
+          if (id) processedIds.add(id);
+
+          setStatus(`Processed ${acted}/${maxN}`);
+        } catch (e) {
+          console.warn('Action error:', e);
+          setStatus(`Error… ${acted}/${maxN}`);
+        }
+      }
+
+      if (acted >= maxN) break;
+      if (!running) break;
+
+      // If nothing new was processed this loop, try scrolling to load more
+      if (doScroll) {
+        if (!progressedThisLoop) idleScrolls++;
+        else idleScrolls = 0;
+
+        await autoScrollOnce(stepPx, scrollDelay);
+
+        // Optional: if repeated idle scrolls find nothing, pause a bit
+        if (idleScrolls >= 3) {
+          await sleep(1200);
+          idleScrolls = 0;
+        }
+      } else {
+        // If not auto-scrolling and nothing progressed, we’re done
+        if (!progressedThisLoop) break;
+      }
+    }
+
+    setStatus(`Done ${acted}/${maxN}`);
+    running = false;
+  }
+
+  /* ========== Events ========== */
+  scanBtn.addEventListener('click', () => { scan(); });
+  startBtn.addEventListener('click', () => { if (!running) run(); });
+  stopBtn.addEventListener('click', () => { running = false; setStatus('Stopping…'); });
+
+  /* Tips:
+   * - Open a hashtag or search page; pick Top/Latest.
+   * - Enter the hashtag (without #). Keep “only tweets containing this hashtag” checked to filter strictly.
+   * - With auto scroll enabled, it keeps discovering new tweets until Max is reached or you Stop.
+   * - Skips items with the “Ad” label. DOM changes happen; update data-testid selectors if needed.
+   * - Use sensible delays to avoid throttling/blocks.
+   */
+})();
