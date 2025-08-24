@@ -1,0 +1,208 @@
+// ==UserScript==
+// @name         X: Like & Repost Replies (status inline with Hide)
+// @namespace    https://example.com
+// @authot       janeviixl
+// @version      1.3.1
+// @description  Like & Repost loaded replies on a tweet detail page. Panel minimizes to a draggable purple circle; status sits inline with Hide.
+// @match        https://twitter.com/*/status/*
+// @match        https://x.com/*/status/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  async function safeClick(el) {
+    if (!el) return false;
+    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch {}
+    try {
+      const rect = el.getBoundingClientRect();
+      const opts = { bubbles: true, cancelable: true, clientX: rect.left + 5, clientY: rect.top + 5 };
+      el.dispatchEvent(new MouseEvent('pointerdown', opts));
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      el.dispatchEvent(new MouseEvent('pointerup', opts));
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return true;
+    } catch (e) { try { el.click(); return true; } catch { return false; } }
+  }
+
+  const store = {
+    get(key, def) { try { return JSON.parse(localStorage.getItem(key)) ?? def; } catch { return def; } },
+    set(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
+  };
+
+  function makeDraggable(el, positionKey) {
+    let isDown = false, sx = 0, sy = 0, startL = 0, startT = 0;
+    const saved = store.get(positionKey, null);
+    if (saved && typeof saved.left === 'number' && typeof saved.top === 'number') {
+      el.style.left = saved.left + 'px';
+      el.style.top  = saved.top + 'px';
+      el.style.right = 'auto';
+      el.style.bottom = 'auto';
+    }
+    const onDown = (e) => { isDown = true; const r = el.getBoundingClientRect(); sx = e.clientX; sy = e.clientY; startL = r.left; startT = r.top; e.preventDefault(); };
+    const onMove = (e) => { if (!isDown) return; el.style.left = (startL + (e.clientX - sx)) + 'px'; el.style.top = (startT + (e.clientY - sy)) + 'px'; el.style.right='auto'; el.style.bottom='auto'; };
+    const onUp   = () => { if (!isDown) return; isDown = false; if (positionKey) { const r = el.getBoundingClientRect(); store.set(positionKey, { left: r.left, top: r.top }); } };
+    el.addEventListener('mousedown', onDown);
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
+  /* ===== UI ===== */
+  const panel = document.createElement('div');
+  panel.id = 'xr-panel';
+  Object.assign(panel.style, {
+    position: 'fixed', right: '16px', bottom: '16px', zIndex: '999999',
+    background: 'rgba(24,24,24,0.95)', color: '#fff', padding: '12px 14px',
+    borderRadius: '12px', boxShadow: '0 6px 18px rgba(0,0,0,0.35)',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif',
+    fontSize: '14px', userSelect: 'none', cursor: 'move'
+  });
+
+  panel.innerHTML = `
+    <div style="font-weight:600;margin-bottom:6px;cursor:default;">Replies: Like + Repost</div>
+    <label style="display:block;margin:6px 0 4px;cursor:default;">Max to process:
+      <input id="xr-max" type="number" min="1" value="100" style="width:70px;margin-left:6px;">
+    </label>
+    <label style="display:block;margin:6px 0 4px;cursor:default;">Base delay (ms):
+      <input id="xr-delay" type="number" min="0" value="800" style="width:80px;margin-left:6px;">
+    </label>
+    <label style="display:block;margin:6px 0 8px;cursor:default;">Jitter (±ms):
+      <input id="xr-jitter" type="number" min="0" value="400" style="width:80px;margin-left:6px;">
+    </label>
+
+    <!-- Controls row with status inline BEFORE the Hide button -->
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <button id="xr-scan"  style="padding:6px 10px;cursor:pointer;">Scan</button>
+      <button id="xr-start" style="padding:6px 10px;cursor:pointer;">Start</button>
+      <button id="xr-stop"  style="padding:6px 10px;cursor:pointer;">Stop</button>
+      <span id="xr-status" style="margin-left:auto;font-size:12px;opacity:0.9;white-space:nowrap;">Idle</span>
+      <button id="xr-hide"  style="padding:6px 10px;cursor:pointer;">Hide</button>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  // Minimized circle
+  const circle = document.createElement('div');
+  circle.id = 'xr-circle';
+  Object.assign(circle.style, {
+    position: 'fixed', right: '20px', bottom: '20px', width: '46px', height: '46px',
+    borderRadius: '50%', background: 'purple', color: '#fff', display: 'none',
+    alignItems: 'center', justifyContent: 'center', zIndex: '999999',
+    boxShadow: '0 6px 18px rgba(0,0,0,0.35)', fontWeight: '700', fontSize: '18px',
+    userSelect: 'none', cursor: 'move'
+  });
+  circle.title = 'Show controls';
+  circle.textContent = '⋯';
+  document.body.appendChild(circle);
+
+  const wasMin = store.get('xr:minimized', false);
+  if (wasMin) { panel.style.display = 'none'; circle.style.display = 'flex'; }
+  makeDraggable(panel, 'xr:panel:pos');
+  makeDraggable(circle, 'xr:circle:pos');
+
+  circle.addEventListener('click', () => { panel.style.display = 'block'; circle.style.display = 'none'; store.set('xr:minimized', false); });
+  panel.querySelector('#xr-hide').addEventListener('click', () => { panel.style.display = 'none'; circle.style.display = 'flex'; store.set('xr:minimized', true); });
+
+  const $ = (sel) => panel.querySelector(sel);
+  const statusEl = $('#xr-status');
+  const scanBtn  = $('#xr-scan');
+  const startBtn = $('#xr-start');
+  const stopBtn  = $('#xr-stop');
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  /* ===== Selection logic ===== */
+  function getReplyArticles() {
+    const all = Array.from(document.querySelectorAll('article'));
+    const withActions = all.filter(a =>
+      (a.querySelector('[data-testid="like"], [data-testid="unlike"]')) &&
+      (a.querySelector('[data-testid="retweet"], [data-testid="unretweet"]'))
+    );
+    return withActions.slice(1); // skip main tweet
+  }
+
+  /* ===== Actions ===== */
+  let running = false;
+
+  async function ensureLiked(article) {
+    const unlikeBtn = article.querySelector('[data-testid="unlike"]');
+    if (unlikeBtn) return false;
+    const likeBtn = article.querySelector('[data-testid="like"]');
+    if (!likeBtn) return false;
+    await safeClick(likeBtn);
+    return true;
+  }
+
+  async function ensureReposted(article) {
+    const unretweetBtn = article.querySelector('[data-testid="unretweet"]');
+    if (unretweetBtn) return false;
+    const retweetBtn = article.querySelector('[data-testid="retweet"]');
+    if (!retweetBtn) return false;
+
+    await safeClick(retweetBtn);
+
+    let confirm;
+    for (let i = 0; i < 15; i++) {
+      await sleep(100);
+      confirm = document.querySelector('[data-testid="retweetConfirm"]')
+        || Array.from(document.querySelectorAll('div[role="menuitem"], div[role="button"]'))
+             .find(el => /repost/i.test(el.textContent || ''));
+      if (confirm) break;
+    }
+    if (confirm) { await safeClick(confirm); return true; }
+    return false;
+  }
+
+  async function likeAndRepostAll() {
+    running = true;
+    setStatus('Scanning…');
+
+    const maxToProcess = Math.max(1, parseInt($('#xr-max').value || '100', 10));
+    const baseDelay = Math.max(0, parseInt($('#xr-delay').value || '800', 10));
+    const jitter = Math.max(0, parseInt($('#xr-jitter').value || '400', 10));
+
+    const articles = getReplyArticles();
+    setStatus(`Found ${articles.length}`);
+
+    let acted = 0;
+    for (const article of articles) {
+      if (!running) { setStatus('Stopped'); return; }
+      if (acted >= maxToProcess) break;
+
+      try {
+        if (!article.querySelector('[role="group"]')) continue;
+
+        const liked = await ensureLiked(article);
+        await sleep(baseDelay + randInt(-jitter, jitter));
+
+        const reposted = await ensureReposted(article);
+        await sleep(baseDelay + randInt(-jitter, jitter));
+
+        if (liked || reposted) acted++;
+        setStatus(`Processed ${acted}/${Math.min(maxToProcess, articles.length)}`);
+      } catch (e) {
+        console.warn('Like/Repost error:', e);
+        setStatus(`Error, continuing… ${acted}`);
+      }
+    }
+
+    setStatus(`Done ${acted}`);
+    running = false;
+  }
+
+  /* ===== Events ===== */
+  scanBtn.addEventListener('click', () => {
+    const n = getReplyArticles().length;
+    setStatus(`Found ${n}`);
+  });
+  startBtn.addEventListener('click', () => { if (!running) likeAndRepostAll(); });
+  stopBtn.addEventListener('click', () => { running = false; setStatus('Stopping…'); });
+
+  /* Tips:
+   * - Open a tweet’s detail page (/status/), scroll to load replies, click Scan to check count, then Start.
+   * - Skips already liked/reposted. Adjust delays to avoid throttling.
+   */
+})();
