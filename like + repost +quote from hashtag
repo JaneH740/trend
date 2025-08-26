@@ -1,0 +1,621 @@
+// ==UserScript==
+// @name         X: Hashtag Like + Repost + Quote (targets "Quote" button)
+// @namespace    hashtag-quote-tool
+// @version      1.5.0
+// @description  Like → Repost → Quote tweets on hashtag/search pages, pulling quote text from a Google Sheet. Panel fixed; hidden purple circle draggable. Targets the composer’s “Quote” button explicitly.
+// @match        https://x.com/hashtag/*
+// @match        https://twitter.com/hashtag/*
+// @match        https://x.com/search*
+// @match        https://twitter.com/search*
+// @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @connect      docs.google.com
+// @connect      googleusercontent.com
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ---------------- Core helpers ---------------- */
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+
+  function waitForBody() {
+    return new Promise(res => {
+      if (document.body) return res();
+      const obs = new MutationObserver(() => {
+        if (document.body) { obs.disconnect(); res(); }
+      });
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+    });
+  }
+
+  async function safeClick(el) {
+    if (!el) return false;
+    try { el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch {}
+    try {
+      const r = el.getBoundingClientRect();
+      const opts = { bubbles: true, cancelable: true, clientX: r.left + 5, clientY: r.top + 5 };
+      el.dispatchEvent(new MouseEvent('pointerdown', opts));
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      el.dispatchEvent(new MouseEvent('pointerup', opts));
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return true;
+    } catch { try { el.click(); return true; } catch { return false; } }
+  }
+
+  const store = {
+    get(k, d){ try{ return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+    set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+  };
+
+  /* ---------------- Hashtag + tweet selection ---------------- */
+  const normTag = (tag) => (tag || '').replace(/^#/, '').trim();
+
+  function hashtagFromURL() {
+    const m = location.pathname.match(/\/hashtag\/([^/?#]+)/i);
+    if (m && m[1]) return decodeURIComponent(m[1]);
+    const u = new URL(location.href);
+    const q = u.searchParams.get('q') || '';
+    const mm = q.match(/%23([A-Za-z0-9_]+)/) || q.match(/#([A-Za-z0-9_]+)/);
+    if (mm && mm[1]) return decodeURIComponent(mm[1]);
+    return '';
+  }
+
+  function articleHasHashtag(article, tagNorm) {
+    if (!tagNorm) return true;
+    const tagLc = tagNorm.toLowerCase();
+    const anchors = article.querySelectorAll('a[role="link"][href*="/hashtag/"]');
+    for (const a of anchors) {
+      const href = a.getAttribute('href') || '';
+      const mm = href.match(/\/hashtag\/([^/?#]+)/i);
+      if (mm && mm[1] && normTag(decodeURIComponent(mm[1])).toLowerCase() === tagLc) return true;
+    }
+    return (article.innerText || '').toLowerCase().includes('#' + tagLc);
+  }
+
+  function isAdArticle(article) {
+    const badges = article.querySelectorAll('span, div');
+    if (Array.from(badges).some(el => el.textContent.trim() === 'Ad')) return true;
+    if (/promoted/i.test(article.innerText || '')) return true;
+    return false;
+  }
+
+  function getTweetId(article) {
+    const link = article.querySelector('a[href*="/status/"]');
+    const m = link?.getAttribute('href')?.match(/\/status\/(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  function getActionableArticles(tagNorm, onlyWithHashtag) {
+    const all = Array.from(document.querySelectorAll('article'));
+    const withActions = all.filter(a =>
+      (a.querySelector('[data-testid="like"], [data-testid="unlike"]')) &&
+      (a.querySelector('[data-testid="retweet"], [data-testid="unretweet"]'))
+    );
+    return withActions.filter(a => !isAdArticle(a) && (!onlyWithHashtag || articleHasHashtag(a, tagNorm)));
+  }
+
+  /* ---------------- Google Sheets loader ---------------- */
+  function normalizeSheetLinkToFetchPlan(sheetUrl) {
+    try {
+      const u = new URL(sheetUrl);
+      if (/\/export/i.test(u.pathname) && u.searchParams.get('format') === 'csv') {
+        return { label: 'csv-export', type: 'csv', url: u.toString() };
+      }
+      if (/\/pub$/i.test(u.pathname) && u.searchParams.get('output') === 'csv') {
+        return { label: 'pub-csv', type: 'csv', url: u.toString() };
+      }
+      if (/\/pubhtml/i.test(u.pathname)) {
+        return { label: 'pubhtml', type: 'html', url: u.toString() };
+      }
+      const m = u.pathname.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      if (m && m[1]) {
+        const fileId = m[1];
+        let gid = '0';
+        const hashGid = u.hash.match(/gid=(\d+)/);
+        if (hashGid && hashGid[1]) gid = hashGid[1];
+        const queryGid = u.searchParams.get('gid');
+        if (queryGid) gid = queryGid;
+        return {
+          label: 'derived-csv',
+          type: 'csv',
+          url: `https://docs.google.com/spreadsheets/d/${fileId}/export?format=csv&gid=${gid}`
+        };
+      }
+      return { label: 'fallback-html', type: 'html', url: u.toString() };
+    } catch {
+      return { label: 'raw', type: 'csv', url: sheetUrl };
+    }
+  }
+
+  function fetchResource(url, accept) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers: { 'Accept': accept },
+        onload: (res) => {
+          if (res.status >= 200 && res.status < 300) resolve(res.responseText);
+          else reject(new Error(`HTTP ${res.status} for ${url}`));
+        },
+        onerror: () => reject(new Error(`Network error for ${url}`)),
+      });
+    });
+  }
+
+  function parseCSV(text) {
+    const rows = [];
+    let cur = [], val = '', inQuotes = false;
+    for (let i=0; i<text.length; i++) {
+      const c=text[i], n=text[i+1];
+      if (inQuotes) {
+        if (c === '"' && n === '"') { val += '"'; i++; }
+        else if (c === '"') { inQuotes = false; }
+        else { val += c; }
+      } else {
+        if (c === '"') inQuotes = true;
+        else if (c === ',') { cur.push(val); val=''; }
+        else if (c === '\r') { /* ignore */ }
+        else if (c === '\n') { cur.push(val); rows.push(cur); cur=[]; val=''; }
+        else { val += c; }
+      }
+    }
+    if (val.length || cur.length) { cur.push(val); rows.push(cur); }
+    return rows;
+  }
+
+  function extractFirstColumnFromCSV(csvText) {
+    const rows = parseCSV(csvText);
+    const out = [];
+    for (const r of rows) {
+      if (!r || !r.length) continue;
+      const v = String(r[0] ?? '').trim();
+      if (v) out.push(v);
+    }
+    return out;
+  }
+
+  function extractFirstColumnFromPublishedHTML(html) {
+    const tmp = document.implementation.createHTMLDocument('sheet');
+    tmp.documentElement.innerHTML = html;
+    const table = tmp.querySelector('table.waffle') || tmp.querySelector('table');
+    if (!table) return [];
+    const out = [];
+    for (const tr of table.querySelectorAll('tr')) {
+      const cell = tr.querySelector('td,th');
+      if (!cell) continue;
+      const v = cell.innerText.trim();
+      if (v) out.push(v);
+    }
+    return out;
+  }
+
+  async function loadFirstColumnFromSheet(anyLink, statusCb) {
+    const plan = normalizeSheetLinkToFetchPlan(anyLink);
+    statusCb?.(`Resolving… (${plan.label})`);
+    try {
+      if (plan.type === 'csv') {
+        statusCb?.('Fetching CSV…');
+        const text = await fetchResource(plan.url, 'text/csv');
+        const lines = extractFirstColumnFromCSV(text);
+        statusCb?.(`Loaded ${lines.length} lines from CSV`);
+        return lines;
+      } else {
+        statusCb?.('Fetching HTML…');
+        const html = await fetchResource(plan.url, 'text/html');
+        const lines = extractFirstColumnFromPublishedHTML(html);
+        statusCb?.(`Loaded ${lines.length} lines from HTML`);
+        return lines;
+      }
+    } catch (err) {
+      statusCb?.(`Load failed: ${err.message}`);
+      throw err;
+    }
+  }
+
+  /* ---------------- Actions: like, repost ---------------- */
+  async function ensureLiked(article) {
+    if (article.querySelector('[data-testid="unlike"]')) return false;
+    const likeBtn = article.querySelector('[data-testid="like"]');
+    if (!likeBtn) return false;
+    await safeClick(likeBtn);
+    return true;
+  }
+
+  async function ensureReposted(article) {
+    if (article.querySelector('[data-testid="unretweet"]')) return false;
+    const rtBtn = article.querySelector('[data-testid="retweet"]');
+    if (!rtBtn) return false;
+    await safeClick(rtBtn);
+
+    let confirm;
+    for (let i=0;i<20;i++){
+      await sleep(100);
+      confirm = document.querySelector('[data-testid="retweetConfirm"]')
+        || Array.from(document.querySelectorAll('div[role="menuitem"], div[role="button"]'))
+              .find(el => /repost/i.test((el.textContent || '').trim()));
+      if (confirm) break;
+    }
+    if (confirm) { await safeClick(confirm); return true; }
+    return false;
+  }
+
+  /* ---------------- Robust QUOTE (targets “Quote” button) ---------------- */
+  function getComposerDialog() {
+    const dialogs = Array.from(document.querySelectorAll('div[role="dialog"], section[role="dialog"], div[aria-modal="true"]'));
+    return dialogs.find(d => d.querySelector('[data-testid^="tweetTextarea_"], div[role="textbox"][contenteditable="true"]')) || null;
+  }
+
+  function getComposerEditable() {
+    const dlg = getComposerDialog();
+    if (!dlg) return null;
+    return (
+      dlg.querySelector('[data-testid^="tweetTextarea_"] div[contenteditable="true"]') ||
+      dlg.querySelector('div[role="textbox"][data-testid^="tweetTextarea_"]') ||
+      dlg.querySelector('div[role="textbox"][contenteditable="true"]') ||
+      dlg.querySelector('div[contenteditable="true"][data-testid="composerTextInput"]')
+    );
+  }
+
+  async function waitForComposer(timeoutMs = 4000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const dlg = getComposerDialog();
+      const editable = getComposerEditable();
+      if (dlg && editable) return true;
+      await sleep(80);
+    }
+    return false;
+  }
+
+  function getQuoteSubmitButton() {
+    const dlg = getComposerDialog();
+    if (!dlg) return null;
+
+    // Try known testids first (in case your build still uses them)
+    let btn = dlg.querySelector('[data-testid="tweetButtonInline"]') ||
+              dlg.querySelector('[data-testid="tweetButton"]');
+    if (btn) return btn;
+
+    // General scan inside the dialog for a button/div with visible text EXACTLY "Quote"
+    const candidates = Array.from(dlg.querySelectorAll('div[role="button"], button'));
+    // Some UIs wrap text inside spans; we normalize textContent.
+    btn = candidates.find(b => /^\s*quote\s*$/i.test((b.textContent || '').trim()));
+    if (btn) return btn;
+
+    // Fallbacks if your UI occasionally says “Post” or “Tweet”
+    btn = candidates.find(b => /^\s*(post|tweet)\s*$/i.test((b.textContent || '').trim()));
+    return btn || null;
+  }
+
+  function setComposerText(text) {
+    const editable = getComposerEditable();
+    if (!editable) return false;
+    editable.focus();
+    try {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editable);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.execCommand('delete');
+    } catch {}
+    editable.textContent = text;
+    editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    return true;
+  }
+
+  async function submitQuote() {
+    // Try clicking the QUOTE button several times (handles late-enable animations)
+    for (let i = 0; i < 35; i++) {
+      const btn = getQuoteSubmitButton();
+      if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+        await safeClick(btn);
+        await sleep(250);
+        if (!getComposerDialog()) return true; // modal closed -> success
+      }
+      await sleep(100);
+    }
+
+    // Fallback: Cmd/Ctrl + Enter shortcut
+    const editable = getComposerEditable();
+    if (editable) {
+      editable.focus();
+      const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+      for (let k = 0; k < 2; k++) {
+        const ev = new KeyboardEvent('keydown', {
+          bubbles: true, cancelable: true,
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+          ctrlKey: !isMac, metaKey: isMac
+        });
+        editable.dispatchEvent(ev);
+        await sleep(300);
+        if (!getComposerDialog()) return true;
+      }
+    }
+    return false;
+  }
+
+  async function openQuoteComposer(article) {
+    const rtBtn = article.querySelector('[data-testid="retweet"]') || article.querySelector('[data-testid="unretweet"]');
+    if (!rtBtn) return false;
+    await safeClick(rtBtn);
+
+    let quoteItem = null;
+    for (let i = 0; i < 25; i++) {
+      await sleep(80);
+      const items = Array.from(document.querySelectorAll('div[role="menuitem"], div[role="button"], button[role="menuitem"]'));
+      quoteItem = items.find(el => /^\s*quote(\s+post)?\s*$/i.test((el.textContent || '').trim()));
+      if (quoteItem) break;
+    }
+    if (!quoteItem) return false;
+    await safeClick(quoteItem);
+
+    return await waitForComposer(4000);
+  }
+
+  async function likeRepostQuote(article, quoteText, delay, jitter) {
+    await ensureLiked(article);
+    await sleep(delay + randInt(-jitter, jitter));
+    await ensureReposted(article);
+    await sleep(delay + randInt(-jitter, jitter));
+
+    const opened = await openQuoteComposer(article);
+    if (!opened) return false;
+
+    const ok = setComposerText(quoteText);
+    await sleep(150);
+    if (!ok) return false;
+
+    return await submitQuote();
+  }
+
+  /* ---------------- UI (panel fixed; purple circle draggable) ---------------- */
+  async function mountUI() {
+    await waitForBody();
+
+    const panel = document.createElement('div');
+    panel.id = 'xh-panel';
+    Object.assign(panel.style, {
+      position:'fixed', right:'16px', bottom:'16px', zIndex:'999999',
+      background:'rgba(24,24,24,0.95)', color:'#fff', padding:'12px 14px',
+      borderRadius:'12px', boxShadow:'0 6px 18px rgba(0,0,0,0.35)',
+      fontFamily:'system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif',
+      fontSize:'14px', userSelect:'text'
+    });
+
+    const initialTag = normTag(hashtagFromURL());
+    const initialLink = GM_getValue('xh_sheetAny', '');
+
+    panel.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+        <div style="font-weight:600;">Hashtag Like + Repost + Quote</div>
+        <span id="xh-status" style="margin-left:auto;font-size:12px;opacity:0.9;">Idle</span>
+        <button id="xh-hide" style="padding:6px 10px;cursor:pointer;">Hide</button>
+      </div>
+
+      <label style="display:block;margin:6px 0 4px;">Hashtag:
+        <input id="xr-tag" type="text" placeholder="e.g. JimmySea" value="${initialTag}" style="width:180px;margin-left:6px;">
+      </label>
+
+      <label style="display:block;margin:6px 0 4px;">Google Sheet (any public link):
+        <input id="xr-sheet" type="text" placeholder="Paste Sheet URL" value="${initialLink}" style="width:330px;margin-left:6px;">
+      </label>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;">
+        <button id="xr-load"   style="padding:6px 10px;cursor:pointer;">Load Sheet</button>
+        <button id="xr-test"   style="padding:6px 10px;cursor:pointer;">Test Sample</button>
+        <label><input id="xr-only-hashtag" type="checkbox" checked> only tweets containing this hashtag</label>
+        <label><input id="xr-autoscroll" type="checkbox" checked> auto scroll while running</label>
+        <label><input id="xr-loop" type="checkbox"> loop quotes when out</label>
+      </div>
+
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin:6px 0;">
+        <label>Max: <input id="xr-max" type="number" min="1" value="100" style="width:70px;margin-left:6px;"></label>
+        <label>Delay (ms): <input id="xr-delay" type="number" min="0" value="950" style="width:80px;margin-left:6px;"></label>
+        <label>Jitter (±ms): <input id="xr-jitter" type="number" min="0" value="450" style="width:80px;margin-left:6px;"></label>
+        <label>Scroll step (px): <input id="xr-scroll-step" type="number" min="200" value="800" style="width:80px;margin-left:6px;"></label>
+        <label>Scroll delay (ms): <input id="xr-scroll-delay" type="number" min="200" value="1200" style="width:90px;margin-left:6px;"></label>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button id="xr-scan"  style="padding:6px 10px;cursor:pointer;">Scan</button>
+        <button id="xr-start" style="padding:6px 10px;cursor:pointer;">Start</button>
+        <button id="xr-stop"  style="padding:6px 10px;cursor:pointer;">Stop</button>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    // Purple circle (draggable only)
+    const circle = document.createElement('div');
+    circle.id = 'xh-circle';
+    Object.assign(circle.style, {
+      position:'fixed', right:'20px', bottom:'20px', width:'46px', height:'46px',
+      borderRadius:'50%', background:'purple', color:'#fff', display:'none',
+      alignItems:'center', justifyContent:'center', zIndex:'999999',
+      boxShadow:'0 6px 18px rgba(0,0,0,0.35)', fontWeight:'700', fontSize:'18px',
+      userSelect:'none', cursor:'move'
+    });
+    circle.title = 'Show controls';
+    circle.textContent = '⋯';
+    document.body.appendChild(circle);
+
+    // Drag the circle, not the panel
+    (function makeCircleDraggable() {
+      const saved = store.get('xh:circle:pos', null);
+      if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+        circle.style.left = saved.left + 'px';
+        circle.style.top  = saved.top + 'px';
+        circle.style.right='auto'; circle.style.bottom='auto';
+      }
+      let down=false, sx=0, sy=0, sl=0, st=0;
+      circle.addEventListener('mousedown', e=>{
+        down=true; const r=circle.getBoundingClientRect(); sx=e.clientX; sy=e.clientY; sl=r.left; st=r.top; e.preventDefault();
+      });
+      document.addEventListener('mousemove', e=>{
+        if (!down) return;
+        const nl = sl + (e.clientX - sx);
+        const nt = st + (e.clientY - sy);
+        circle.style.left = nl + 'px';
+        circle.style.top  = nt + 'px';
+        circle.style.right='auto'; circle.style.bottom='auto';
+      });
+      document.addEventListener('mouseup', ()=>{
+        if (!down) return;
+        down=false;
+        const r=circle.getBoundingClientRect();
+        store.set('xh:circle:pos', { left: r.left, top: r.top });
+      });
+    })();
+
+    document.getElementById('xh-hide').addEventListener('click', ()=>{
+      panel.style.display='none';
+      circle.style.display='flex';
+    });
+    circle.addEventListener('click', ()=>{
+      panel.style.display='block';
+      circle.style.display='none';
+    });
+
+    return panel;
+  }
+
+  /* ---------------- Main loop ---------------- */
+  let quotes = [];
+  let quoteIdx = 0;
+  let running = false;
+  const processedIds = new Set();
+  const setStatus = (t) => { const el = document.getElementById('xh-status'); if (el) el.textContent = t; };
+
+  async function doLoadSheet(anyLink) {
+    GM_setValue('xh_sheetAny', anyLink);
+    setStatus('Resolving link…');
+    const lines = await loadFirstColumnFromSheet(anyLink, setStatus);
+    quotes = lines.map(s => String(s).trim()).filter(Boolean);
+    quoteIdx = 0;
+    setStatus(`Loaded ${quotes.length} lines`);
+    return quotes.length;
+  }
+
+  function getNextQuote(loop) {
+    if (!quotes.length) return null;
+    if (quoteIdx >= quotes.length) {
+      if (loop) quoteIdx = 0;
+      else return null;
+    }
+    return quotes[quoteIdx++];
+  }
+
+  function scanArticles() {
+    const tag = normTag(document.getElementById('xr-tag').value || '');
+    const only = document.getElementById('xr-only-hashtag').checked;
+    const list = getActionableArticles(tag, only);
+    const fresh = list.filter(a => { const id = getTweetId(a); return id ? !processedIds.has(id) : true; });
+    setStatus(`Found ${list.length} / New ${fresh.length}`);
+    return { list, fresh };
+  }
+
+  async function autoScroll(stepPx, waitMs) {
+    window.scrollBy(0, stepPx);
+    await sleep(waitMs);
+  }
+
+  async function runLoop() {
+    if (!quotes.length) { setStatus('No sheet loaded'); return; }
+    running = true;
+
+    const maxN = Math.max(1, parseInt(document.getElementById('xr-max').value || '100', 10));
+    const delay = Math.max(0, parseInt(document.getElementById('xr-delay').value || '950', 10));
+    const jitter = Math.max(0, parseInt(document.getElementById('xr-jitter').value || '450', 10));
+    const only = document.getElementById('xr-only-hashtag').checked;
+    const doScroll = document.getElementById('xr-autoscroll').checked;
+    const loopQuotes = document.getElementById('xr-loop').checked;
+    const stepPx = Math.max(200, parseInt(document.getElementById('xr-scroll-step').value || '800', 10));
+    const scrollDelay = Math.max(200, parseInt(document.getElementById('xr-scroll-delay').value || '1200', 10));
+    const tag = normTag(document.getElementById('xr-tag').value || '');
+
+    let acted = 0;
+    let idleLoops = 0;
+
+    while (running && acted < maxN) {
+      const articles = getActionableArticles(tag, only);
+      let progressed = false;
+
+      for (const a of articles) {
+        if (!running || acted >= maxN) break;
+        const id = getTweetId(a);
+        if (id && processedIds.has(id)) continue;
+        if (!a.querySelector('[role="group"]')) continue;
+
+        const quoteText = getNextQuote(loopQuotes);
+        if (!quoteText) { setStatus('Out of quotes'); running = false; break; }
+
+        try {
+          const ok = await likeRepostQuote(a, quoteText, delay, jitter);
+          if (id) processedIds.add(id);
+          if (ok) { acted++; progressed = true; setStatus(`Done ${acted}/${maxN}`); }
+          else { setStatus(`Quote failed… ${acted}/${maxN}`); }
+        } catch (e) {
+          console.warn('Action error:', e);
+          setStatus(`Error… ${acted}/${maxN}`);
+        }
+      }
+
+      if (acted >= maxN || !running) break;
+
+      if (doScroll) {
+        if (!progressed) idleLoops++; else idleLoops = 0;
+        await autoScroll(stepPx, scrollDelay);
+        if (idleLoops >= 3) { await sleep(1200); idleLoops = 0; }
+      } else {
+        if (!progressed) break;
+      }
+    }
+
+    setStatus(`Finished ${acted}/${maxN}`);
+    running = false;
+  }
+
+  /* ---------------- Mount & wire ---------------- */
+  (async function init() {
+    const panel = await mountUI();
+
+    panel.querySelector('#xr-load').addEventListener('click', async () => {
+      const link = document.getElementById('xr-sheet').value.trim();
+      if (!link) { setStatus('Sheet URL missing'); return; }
+      try { await doLoadSheet(link); } catch {}
+    });
+
+    // Public demo CSV for quick permission test
+    panel.querySelector('#xr-test').addEventListener('click', async () => {
+      const sample = 'https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/export?format=csv&gid=0';
+      document.getElementById('xr-sheet').value = sample;
+      await doLoadSheet(sample);
+    });
+
+    panel.querySelector('#xr-scan').addEventListener('click', () => { scanArticles(); });
+    panel.querySelector('#xr-start').addEventListener('click', () => { if (!running) runLoop(); });
+    panel.querySelector('#xr-stop').addEventListener('click', () => { running = false; setStatus('Stopping…'); });
+
+    setStatus('Paste sheet, Load, then Start');
+
+    // Keep hashtag field in sync when navigating within SPA
+    const hook = () => {
+      const tagInUrl = normTag(hashtagFromURL());
+      if (tagInUrl) {
+        const tagInput = document.getElementById('xr-tag');
+        if (tagInput && !tagInput.value) tagInput.value = tagInUrl;
+      }
+    };
+    const push = history.pushState, replace = history.replaceState;
+    history.pushState = function() { const r = push.apply(this, arguments); window.dispatchEvent(new Event('locationchange')); return r; };
+    history.replaceState = function() { const r = replace.apply(this, arguments); window.dispatchEvent(new Event('locationchange')); return r; };
+    window.addEventListener('popstate', () => window.dispatchEvent(new Event('locationchange')));
+    window.addEventListener('locationchange', hook);
+  })();
+
+})();
